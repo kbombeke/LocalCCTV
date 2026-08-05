@@ -39,13 +39,12 @@ def _grid_dims(n: int) -> tuple[int, int]:
 
 
 def _vlc_instance_args():
-    """Return VLC instance arguments, including plugin path for frozen builds."""
-    args = ["--no-xlib", "--quiet", "--no-video-title-show"]
-    if getattr(sys, "frozen", False):
-        plugin_dir = os.path.join(sys._MEIPASS, "plugins")
-        if os.path.isdir(plugin_dir):
-            args.append(f"--plugin-path={plugin_dir}")
-    return args
+    """Return VLC instance arguments.
+
+    Frozen builds locate the bundled plugins via VLC_PLUGIN_PATH, set by
+    hook-vlc.py at startup — VLC 3 removed the --plugin-path option.
+    """
+    return ["--no-xlib", "--quiet", "--no-video-title-show"]
 
 
 class CameraView(QFrame):
@@ -61,6 +60,7 @@ class CameraView(QFrame):
         self._sub_url = ""
         self._using_sub = False
         self._sub_confirmed = False  # True once sub-stream has played successfully
+        self._sub_attempted = False  # True once we've tried the sub-stream at all
         self._reconnect_count = 0
         self._snapshot_path = os.path.join(SNAPSHOT_DIR, f"cam_{index}.png")
         self._has_snapshot = False
@@ -114,6 +114,12 @@ class CameraView(QFrame):
         self._timeout_timer.setSingleShot(True)
         self._timeout_timer.timeout.connect(self._on_connection_timeout)
 
+        # Deferred switch from main to sub-stream (single-shot). Owned by this
+        # widget so it dies with the view instead of firing on a deleted object.
+        self._sub_switch_timer = QTimer(self)
+        self._sub_switch_timer.setSingleShot(True)
+        self._sub_switch_timer.timeout.connect(lambda: self._connect(prefer_sub=True))
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.status_label.setGeometry(self.rect())
@@ -129,6 +135,7 @@ class CameraView(QFrame):
         self._url = url
         self._sub_url = sub_url
         self._sub_confirmed = False
+        self._sub_attempted = False
         self._reconnect_count = 0
         # Always start with the main URL — it's the one the user configured
         self._connect(prefer_sub=False)
@@ -138,6 +145,7 @@ class CameraView(QFrame):
         self._snapshot_timer.stop()
         self._reconnect_timer.stop()
         self._timeout_timer.stop()
+        self._sub_switch_timer.stop()
         self._stop_player()
 
     def set_status(self, text: str):
@@ -209,11 +217,13 @@ class CameraView(QFrame):
                 self._reconnect_count = 0
                 if self._using_sub:
                     self._sub_confirmed = True
-                # Main stream works — on next reconnect, try the sub-stream
-                # to save bandwidth (if we haven't already)
-                if not self._using_sub and self._sub_url and not self._sub_confirmed:
-                    # Switch to sub-stream now that we know the camera is reachable
-                    QTimer.singleShot(2000, lambda: self._connect(prefer_sub=True))
+                # Main stream works — probe the sub-stream once to save
+                # bandwidth. Guarded by _sub_attempted rather than
+                # _sub_confirmed: a sub-stream that fails must never be
+                # retried from here, or main and sub alternate forever.
+                elif self._sub_url and not self._sub_attempted:
+                    self._sub_attempted = True
+                    self._sub_switch_timer.start(2000)
             return
 
         if state in (vlc.State.Error, vlc.State.Ended, vlc.State.Stopped):
